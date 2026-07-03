@@ -529,3 +529,110 @@ test('ungated discovery endpoints and asset fallback stay available', async () =
   assert.equal(fallback.headers.get('x-assets'), 'hit');
   assert.equal(assets.requests.length, 1);
 });
+
+test('e2e: main user flow (fetch CVEs, subscribe, confirm, read digest and real-time CVE)', async () => {
+  const originalFetch = globalThis.fetch;
+  const payrail = createPayrail();
+  const env = createEnv({
+    payrail,
+    aiRun: async (_model, payload) => {
+      const prompt = payload.messages.at(-1).content;
+      const isCritical = prompt.includes('CVE-2026-9001');
+      return {
+        response: JSON.stringify({
+          ai_impact: isCritical ? 'Critical impact' : 'High impact',
+          ai_mitigation: 'Patch',
+          ai_exploitability: 'poc_likely',
+          ai_priority: isCritical ? 'patch_now' : 'patch_soon',
+          ai_tags: ['test'],
+          ai_class: 'web-app',
+        }),
+      };
+    },
+  });
+
+  const references = ['https://example.com/advisory'];
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(String(url));
+    if (parsed.hostname === 'services.nvd.nist.gov') {
+      if (parsed.searchParams.get('cvssV3Severity') === 'CRITICAL') {
+        const v = nvdVuln({ id: 'CVE-2026-9001', score: 9.8, cwes: ['CWE-89'], refs: references });
+        v.cve.lastModified = new Date().toISOString();
+        return Response.json({ vulnerabilities: [v] });
+      }
+      const v2 = nvdVuln({ id: 'CVE-2026-9002', score: 7.5, refs: references });
+      v2.cve.lastModified = new Date().toISOString();
+      return Response.json({ vulnerabilities: [v2] });
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
+  };
+
+  try {
+    // 1. Trigger cron to fetch and summarize CVEs
+    const runNow = await worker.fetch(
+      req('/api/run-now', { method: 'POST', headers: { 'cf-connecting-ip': '10.0.0.1' } }),
+      env,
+    );
+    assert.equal(runNow.status, 200);
+    const runBody = await readJson(runNow);
+    assert.equal(runBody.total_cves, 2);
+
+    // 2. User subscribes to 'team' tier
+    const subResponse = await worker.fetch(
+      req('/api/subscribe', {
+        method: 'POST',
+        body: JSON.stringify({ email: 'e2e@example.test', tier: 'team' }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      env,
+    );
+    assert.equal(subResponse.status, 402);
+    const subBody = await readJson(subResponse);
+    const quoteId = subBody.quote_id;
+
+    // 3. User confirms payment
+    const confirmResponse = await worker.fetch(
+      req('/api/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ quote_id: quoteId, tx_hash: '0xe2e' }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      env,
+    );
+    assert.equal(confirmResponse.status, 201);
+    const confirmBody = await readJson(confirmResponse);
+    const apiKey = confirmBody.api_key;
+    assert.match(apiKey, /^vpt_/);
+
+    // 4. User fetches latest digest with API key
+    const digestResponse = await worker.fetch(
+      req('/api/digest/latest', { headers: { authorization: `Bearer ${apiKey}` } }),
+      env,
+    );
+    assert.equal(digestResponse.status, 200);
+    const digestBody = await readJson(digestResponse);
+    assert.equal(digestBody.total_cves, 2);
+    assert.equal(digestBody.gated, undefined); // Fully ungated
+
+    // 5. User fetches a specific CVE in real-time
+    const cveId = 'CVE-2026-9001';
+    const cveResponse = await worker.fetch(
+      req(`/api/cve/${cveId}`, { headers: { authorization: `Bearer ${apiKey}` } }),
+      env,
+    );
+    assert.equal(cveResponse.status, 200);
+    const cveBody = await readJson(cveResponse);
+    assert.equal(cveBody.id, cveId);
+
+    // 6. Free user fetches the same CVE and is gated (24h delay)
+    const freeResponse = await worker.fetch(
+      req(`/api/cve/${cveId}`, { headers: { 'cf-connecting-ip': '10.0.0.2' } }),
+      env,
+    );
+    assert.equal(freeResponse.status, 402);
+    const freeBody = await readJson(freeResponse);
+    assert.equal(freeBody.error, 'gated');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
